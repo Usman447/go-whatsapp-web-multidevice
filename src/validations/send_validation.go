@@ -119,6 +119,11 @@ func ValidateSendImage(ctx context.Context, request domainSend.ImageRequest) err
 		if !availableMimes[request.Image.Header.Get("Content-Type")] {
 			return pkgError.ValidationError("your image is not allowed. please use jpg/jpeg/png")
 		}
+
+		if request.Image.Size > config.WhatsappSettingMaxImageSize {
+			maxSizeString := humanize.Bytes(uint64(config.WhatsappSettingMaxImageSize))
+			return pkgError.ValidationError(fmt.Sprintf("max image upload is %s, please upload in cloud and send via text if your file is higher than %s", maxSizeString, maxSizeString))
+		}
 	}
 
 	if request.ImageURL != nil {
