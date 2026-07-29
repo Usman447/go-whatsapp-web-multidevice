@@ -10,8 +10,15 @@ import (
 
 const DriverName = "sqlite"
 
-// FormatChatStorageURI formats the URI for chat storage using modernc pragmas
+// FormatChatStorageURI formats the URI for chat storage using modernc pragmas.
+// Any existing query string (including go-sqlite3-style _foreign_keys / _journal_mode)
+// is stripped so cross-compiled Windows binaries are not fed incompatible params.
 func FormatChatStorageURI(baseURI string, enableWAL bool, enableFK bool) string {
+	clean := baseURI
+	if idx := strings.Index(baseURI, "?"); idx >= 0 {
+		clean = baseURI[:idx]
+	}
+
 	var pragmaParams []string
 	if enableWAL {
 		pragmaParams = append(pragmaParams, "_pragma=journal_mode(WAL)", "_pragma=busy_timeout(30000)", "_pragma=synchronous(1)")
@@ -21,12 +28,7 @@ func FormatChatStorageURI(baseURI string, enableWAL bool, enableFK bool) string 
 	}
 
 	if len(pragmaParams) == 0 {
-		return baseURI
+		return clean
 	}
-
-	delimiter := "?"
-	if strings.Contains(baseURI, "?") {
-		delimiter = "&"
-	}
-	return baseURI + delimiter + strings.Join(pragmaParams, "&")
+	return clean + "?" + strings.Join(pragmaParams, "&")
 }
