@@ -77,7 +77,16 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 		defer close(chImage) // Ensure channel is closed when done
 		for evt := range ch {
 			response.Code = evt.Code
-			response.Duration = evt.Timeout / time.Second / 2
+			// Use (nearly) the full WhatsApp QR lifetime. Halving it made FlexBase
+			// re-call Login() while the phone could still scan, and each Login()
+			// Disconnect()s — producing "can't connect right now" on the phone.
+			response.Duration = evt.Timeout / time.Second
+			if response.Duration > 5 {
+				response.Duration -= 2
+			}
+			if response.Duration < 15 {
+				response.Duration = 15
+			}
 			if evt.Event == "code" {
 				qrPath := fmt.Sprintf("%s/scan-qr-%s.png", config.PathQrCode, fiberUtils.UUIDv4())
 				if err := qrcode.WriteFile(evt.Code, qrcode.Medium, 512, qrPath); err != nil {
