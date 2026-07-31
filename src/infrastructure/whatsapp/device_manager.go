@@ -426,6 +426,7 @@ func (m *DeviceManager) resetDeviceKeepSlot(deviceID string) error {
 }
 
 // CreateDevice registers a new device placeholder so routes can be scoped strictly by device_id.
+// Idempotent: logout keeps the slot, so re-login / ensure-device must not panic on "already exists".
 func (m *DeviceManager) CreateDevice(ctx context.Context, requestedID string) (*DeviceInstance, error) {
 	if m == nil {
 		return nil, fmt.Errorf("device manager not initialized")
@@ -439,8 +440,9 @@ func (m *DeviceManager) CreateDevice(ctx context.Context, requestedID string) (*
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.devices[id]; exists {
-		return nil, fmt.Errorf("device %s already exists", id)
+	if existing, exists := m.devices[id]; exists && existing != nil {
+		logrus.WithContext(ctx).Debugf("[DEVICE_MANAGER] device placeholder %s already present — reusing", id)
+		return existing, nil
 	}
 
 	instance := NewDeviceInstance(id, nil, newDeviceChatStorage(id, m.storage))
