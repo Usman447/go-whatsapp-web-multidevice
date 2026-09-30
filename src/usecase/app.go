@@ -19,8 +19,29 @@ import (
 	"github.com/skip2/go-qrcode"
 	"go.mau.fi/libsignal/logger"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
+
+// errRestartLogin asks Login to replace a deleted client and try once more.
+var errRestartLogin = errors.New("restart login after deleted device")
+
+// shouldStartFreshQR is false when Login must not open a new socket: either the
+// store was deleted (replace the client first) or a QR is already scannable.
+func shouldStartFreshQR(storeDeleted, hasLiveQR bool) bool {
+	return !storeDeleted && !hasLiveQR
+}
+
+func qrCodeDuration(timeout time.Duration) time.Duration {
+	d := timeout / time.Second
+	if d > 5 {
+		d -= 2
+	}
+	if d < 15 {
+		d = 15
+	}
+	return d
+}
 
 type serviceApp struct {
 	chatStorageRepo domainChatStorage.IChatStorageRepository
@@ -35,9 +56,30 @@ func NewAppService(chatStorageRepo domainChatStorage.IChatStorageRepository, dev
 }
 
 func (service *serviceApp) Login(ctx context.Context, deviceID string) (response domainApp.LoginResponse, err error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		response, err = service.loginOnce(ctx, deviceID)
+		if !errors.Is(err, errRestartLogin) {
+			return response, err
+		}
+	}
+	return response, pkgError.ErrReconnect
+}
+
+func (service *serviceApp) loginOnce(ctx context.Context, deviceID string) (response domainApp.LoginResponse, err error) {
 	instance, client, err := service.ensureClient(ctx, deviceID)
 	if err != nil {
 		return response, err
+	}
+
+	// A deleted store cannot Connect(). Drop it and let the caller try again on a
+	// fresh device. Do this before any Disconnect so a live QR is not the path
+	// that hits "invalid use of deleted device".
+	if whatsapp.ClientStoreDeleted(client) {
+		logrus.Warnf("[LOGIN][%s] replacing deleted WhatsApp device store", deviceID)
+		if err = service.deviceManager.ReplaceDeletedClient(deviceID); err != nil {
+			return response, err
+		}
+		return response, errRestartLogin
 	}
 
 	if client.IsLoggedIn() {
@@ -45,7 +87,41 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 		return response, pkgError.ErrAlreadyLoggedIn
 	}
 
-	// Disconnect first to ensure QR flow starts cleanly.
+	if path, dur, hasLiveQR := instance.CurrentQRLogin(); hasLiveQR && !shouldStartFreshQR(false, hasLiveQR) {
+		if _, statErr := os.Stat(path); statErr == nil {
+			response.ImagePath = path
+			response.Duration = dur
+			return response, nil
+		}
+		// The snapshot outlived its PNG. Drop it and start a new socket below.
+		instance.ClearQRLogin()
+	}
+
+	if instance.QRLoginActive() {
+		path, dur, waitErr := instance.WaitQRLogin(ctx)
+		if waitErr == nil {
+			response.ImagePath = path
+			response.Duration = dur
+			return response, nil
+		}
+		if !errors.Is(waitErr, whatsapp.ErrQRLoginEnded) {
+			return response, waitErr
+		}
+	}
+
+	gen, started := instance.StartQRLogin()
+	if !started {
+		path, dur, waitErr := instance.WaitQRLogin(ctx)
+		if waitErr != nil {
+			return response, waitErr
+		}
+		response.ImagePath = path
+		response.Duration = dur
+		return response, nil
+	}
+
+	// Disconnect only when this call owns a new QR socket. A second login while
+	// the phone is scanning must take the reuse path above.
 	client.Disconnect()
 	instance.ClearPasskeyState()
 
@@ -55,14 +131,20 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 	// and disconnect the client before the user can scan the code.
 	// Total QR window: ~160s (first code 60s + five codes at 20s each).
 	qrCtx, qrCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	instance.SetQRCancel(gen, qrCancel)
 
 	chImage := make(chan string, 1) // Buffered to prevent goroutine leak
 	ch, err := client.GetQRChannel(qrCtx)
 	if err != nil {
 		qrCancel()
+		instance.EndQRLogin(gen)
 		logrus.Errorf("[LOGIN][%s] GetQRChannel failed: %v", deviceID, err)
 		if errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-			_ = client.Connect()
+			connectErr := client.Connect()
+			if whatsapp.ClientStoreDeleted(client) || errors.Is(connectErr, store.ErrDeviceDeleted) {
+				_ = service.deviceManager.ReplaceDeletedClient(deviceID)
+				return response, errRestartLogin
+			}
 			instance.UpdateStateFromClient()
 			if client.IsLoggedIn() {
 				return response, pkgError.ErrAlreadyLoggedIn
@@ -74,36 +156,50 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 
 	go func() {
 		defer qrCancel()
+		defer instance.EndQRLogin(gen)
 		defer close(chImage) // Ensure channel is closed when done
+		var currentPath string
+		delivered := false
+		defer func() {
+			if currentPath != "" {
+				if err := os.Remove(currentPath); err != nil && !os.IsNotExist(err) {
+					logrus.Errorf("[LOGIN][%s] error when remove qrImage file: %v", deviceID, err)
+				}
+			}
+		}()
 		for evt := range ch {
 			response.Code = evt.Code
 			// Use (nearly) the full WhatsApp QR lifetime. Halving it made FlexBase
 			// re-call Login() while the phone could still scan, and each Login()
 			// Disconnect()s — producing "can't connect right now" on the phone.
-			response.Duration = evt.Timeout / time.Second
-			if response.Duration > 5 {
-				response.Duration -= 2
-			}
-			if response.Duration < 15 {
-				response.Duration = 15
-			}
+			duration := qrCodeDuration(evt.Timeout)
+			response.Duration = duration
 			if evt.Event == "code" {
 				qrPath := fmt.Sprintf("%s/scan-qr-%s.png", config.PathQrCode, fiberUtils.UUIDv4())
 				if err := qrcode.WriteFile(evt.Code, qrcode.Medium, 512, qrPath); err != nil {
 					logrus.Errorf("[LOGIN][%s] Error when write qr code to file: %v", deviceID, err)
 					continue // Skip sending if QR generation failed
 				}
-				go func(path string, duration time.Duration) {
-					time.Sleep(duration * time.Second)
-					if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				instance.UpdateQRLogin(gen, qrPath, duration)
+				if currentPath != "" && currentPath != qrPath {
+					previous := currentPath
+					if err := os.Remove(previous); err != nil && !os.IsNotExist(err) {
 						logrus.Errorf("[LOGIN][%s] error when remove qrImage file: %v", deviceID, err)
 					}
-				}(qrPath, response.Duration)
-				select {
-				case chImage <- qrPath:
-				case <-qrCtx.Done():
-					logrus.Warnf("[LOGIN][%s] QR context canceled while sending QR path", deviceID)
-					return
+				}
+				currentPath = qrPath
+				// Only the first image has to wake the HTTP handler. Later codes
+				// update the snapshot. Sending them too would block this loop once
+				// the handler has returned, and the PNG would be deleted while the
+				// snapshot still pointed at it.
+				if !delivered {
+					select {
+					case chImage <- qrPath:
+						delivered = true
+					case <-qrCtx.Done():
+						logrus.Warnf("[LOGIN][%s] QR context canceled while sending QR path", deviceID)
+						return
+					}
 				}
 			} else if evt.Event == whatsmeow.QRChannelEventPasskeyRequest || evt.Event == whatsmeow.QRChannelEventPasskeyResponse {
 				// Passkey events are broadcast by the global event handler and served via /app/passkey endpoints.
@@ -116,7 +212,14 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 
 	if err = client.Connect(); err != nil {
 		qrCancel()
+		instance.EndQRLogin(gen)
 		logger.Error("Error when connect to whatsapp", err)
+		if errors.Is(err, store.ErrDeviceDeleted) || whatsapp.ClientStoreDeleted(client) {
+			if replaceErr := service.deviceManager.ReplaceDeletedClient(deviceID); replaceErr != nil {
+				return response, replaceErr
+			}
+			return response, errRestartLogin
+		}
 		return response, pkgError.ErrReconnect
 	}
 
@@ -129,6 +232,9 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 			return response, fmt.Errorf("QR channel closed without receiving image")
 		}
 		response.ImagePath = imagePath
+		if _, dur, ok := instance.CurrentQRLogin(); ok {
+			response.Duration = dur
+		}
 	case <-ctx.Done():
 		return response, ctx.Err()
 	case <-time.After(120 * time.Second):
@@ -149,15 +255,38 @@ func (service *serviceApp) LoginWithCode(ctx context.Context, deviceID string, p
 		return loginCode, err
 	}
 
+	if whatsapp.ClientStoreDeleted(client) {
+		if err = service.deviceManager.ReplaceDeletedClient(deviceID); err != nil {
+			return loginCode, err
+		}
+		instance, client, err = service.ensureClient(ctx, deviceID)
+		if err != nil {
+			return loginCode, err
+		}
+	}
+
 	if client.IsLoggedIn() {
 		instance.UpdateStateFromClient()
 		return loginCode, pkgError.ErrAlreadyLoggedIn
 	}
 
-	// Connect before requesting pairing code.
+	// Connect before requesting pairing code. A deleted store cannot connect;
+	// replace it once and retry on a fresh device.
 	if !client.IsConnected() {
 		if err = client.Connect(); err != nil {
-			return loginCode, err
+			if !errors.Is(err, store.ErrDeviceDeleted) && !whatsapp.ClientStoreDeleted(client) {
+				return loginCode, err
+			}
+			if err = service.deviceManager.ReplaceDeletedClient(deviceID); err != nil {
+				return loginCode, err
+			}
+			instance, client, err = service.ensureClient(ctx, deviceID)
+			if err != nil {
+				return loginCode, err
+			}
+			if err = client.Connect(); err != nil {
+				return loginCode, err
+			}
 		}
 	}
 

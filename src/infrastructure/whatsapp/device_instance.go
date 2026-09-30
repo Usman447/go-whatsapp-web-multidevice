@@ -1,6 +1,8 @@
 package whatsapp
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -28,7 +30,20 @@ type DeviceInstance struct {
 	passkeyChallenge     *types.WebAuthnPublicKey
 	passkeyCode          string
 	passkeySkipHandoffUX bool
+
+	// Open QR login. A later Login() returns the latest image while qrActive is set
+	// and must not Disconnect() the socket the phone may already be scanning.
+	qrGen       int
+	qrActive    bool
+	qrImagePath string
+	qrDuration  time.Duration
+	qrReady     chan struct{}
+	qrCancel    context.CancelFunc
 }
+
+// ErrQRLoginEnded is returned when a waiter arrives after the QR channel closed
+// without a scannable image.
+var ErrQRLoginEnded = errors.New("qr login ended")
 
 func NewDeviceInstance(deviceID string, client *whatsmeow.Client, chatStorageRepo domainChatStorage.IChatStorageRepository) *DeviceInstance {
 	jid := ""
@@ -131,6 +146,130 @@ func (d *DeviceInstance) ResetClient() {
 	d.adJID = ""
 	d.phoneNumber = ""
 	d.state = domainDevice.DeviceStateDisconnected
+	d.endQRLocked()
+}
+
+// StartQRLogin marks a new QR socket as in progress. The bool is false when a
+// session is already open; the caller must reuse that session and must not
+// disconnect it. gen identifies this session so a finished goroutine cannot
+// clear a newer one.
+func (d *DeviceInstance) StartQRLogin() (gen int, started bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.qrActive {
+		return d.qrGen, false
+	}
+	d.qrGen++
+	d.qrActive = true
+	d.qrImagePath = ""
+	d.qrDuration = 0
+	d.qrReady = make(chan struct{})
+	return d.qrGen, true
+}
+
+// UpdateQRLogin records the latest scannable image for this generation.
+func (d *DeviceInstance) UpdateQRLogin(gen int, imagePath string, duration time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.qrActive || d.qrGen != gen {
+		return
+	}
+	first := d.qrImagePath == ""
+	d.qrImagePath = imagePath
+	d.qrDuration = duration
+	if first && d.qrReady != nil {
+		close(d.qrReady)
+	}
+}
+
+// CurrentQRLogin returns the latest image while the QR socket is still open.
+func (d *DeviceInstance) CurrentQRLogin() (imagePath string, duration time.Duration, ok bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if !d.qrActive || d.qrImagePath == "" {
+		return "", 0, false
+	}
+	return d.qrImagePath, d.qrDuration, true
+}
+
+// QRLoginActive reports whether a QR socket is open, including before the first image.
+func (d *DeviceInstance) QRLoginActive() bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.qrActive
+}
+
+// WaitQRLogin blocks until the first image of the open session is available.
+func (d *DeviceInstance) WaitQRLogin(ctx context.Context) (string, time.Duration, error) {
+	if path, dur, ok := d.CurrentQRLogin(); ok {
+		return path, dur, nil
+	}
+	d.mu.RLock()
+	ready := d.qrReady
+	active := d.qrActive
+	d.mu.RUnlock()
+	if !active || ready == nil {
+		return "", 0, ErrQRLoginEnded
+	}
+	select {
+	case <-ready:
+		if path, dur, ok := d.CurrentQRLogin(); ok {
+			return path, dur, nil
+		}
+		return "", 0, ErrQRLoginEnded
+	case <-ctx.Done():
+		return "", 0, ctx.Err()
+	}
+}
+
+// SetQRCancel stores the QR context cancel for this generation so a later login
+// can stop a socket whose image file is already gone.
+func (d *DeviceInstance) SetQRCancel(gen int, cancel context.CancelFunc) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.qrGen != gen || !d.qrActive {
+		if cancel != nil {
+			cancel()
+		}
+		return
+	}
+	d.qrCancel = cancel
+}
+
+// EndQRLogin closes the session for gen. A mismatched gen is ignored.
+func (d *DeviceInstance) EndQRLogin(gen int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.qrGen != gen {
+		return
+	}
+	d.endQRLocked()
+}
+
+// ClearQRLogin ends whatever QR session is open so the next login can start clean.
+func (d *DeviceInstance) ClearQRLogin() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.qrGen++
+	d.endQRLocked()
+}
+
+func (d *DeviceInstance) endQRLocked() {
+	if d.qrCancel != nil {
+		d.qrCancel()
+		d.qrCancel = nil
+	}
+	d.qrActive = false
+	d.qrImagePath = ""
+	d.qrDuration = 0
+	if d.qrReady != nil {
+		select {
+		case <-d.qrReady:
+		default:
+			close(d.qrReady)
+		}
+		d.qrReady = nil
+	}
 }
 
 // SetChatStorage swaps the chat storage repository for this device.

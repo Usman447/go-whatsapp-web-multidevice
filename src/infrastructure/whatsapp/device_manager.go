@@ -399,6 +399,28 @@ func (m *DeviceManager) keepSlotLogout(ctx context.Context, deviceID string) err
 	return firstErr
 }
 
+// ClientStoreDeleted reports whether the in-memory whatsmeow device was deleted
+// (failed pairing confirmation, device_removed). Connect() on that client returns
+// store.ErrDeviceDeleted until it is replaced.
+func ClientStoreDeleted(client *whatsmeow.Client) bool {
+	return client != nil && client.Store != nil && client.Store.Deleted
+}
+
+// ReplaceDeletedClient drops a client whose store was deleted, without a remote
+// Logout. The slot id and display name stay. The next EnsureClient builds a fresh
+// store device so QR login can start again.
+func (m *DeviceManager) ReplaceDeletedClient(deviceID string) error {
+	if m == nil {
+		return fmt.Errorf("device manager not initialized")
+	}
+	if inst, ok := m.GetDevice(deviceID); ok && inst != nil {
+		if cli := inst.GetClient(); cli != nil {
+			cli.Disconnect()
+		}
+	}
+	return m.resetDeviceKeepSlot(deviceID)
+}
+
 // resetDeviceKeepSlot detaches the in-memory client and clears the persisted session
 // identity (jid) while keeping the device slot (id + display name) in both the
 // in-memory registry and the persisted device registry. EnsureClient rebuilds a
