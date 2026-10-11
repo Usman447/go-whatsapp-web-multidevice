@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
@@ -46,6 +47,7 @@ func qrCodeDuration(timeout time.Duration) time.Duration {
 type serviceApp struct {
 	chatStorageRepo domainChatStorage.IChatStorageRepository
 	deviceManager   *whatsapp.DeviceManager
+	loginLocks      sync.Map // device id -> chan struct{}, see lockLogin
 }
 
 func NewAppService(chatStorageRepo domainChatStorage.IChatStorageRepository, deviceManager *whatsapp.DeviceManager) domainApp.IAppUsecase {
@@ -56,6 +58,12 @@ func NewAppService(chatStorageRepo domainChatStorage.IChatStorageRepository, dev
 }
 
 func (service *serviceApp) Login(ctx context.Context, deviceID string) (response domainApp.LoginResponse, err error) {
+	unlock, err := service.lockLogin(ctx, deviceID)
+	if err != nil {
+		return response, err
+	}
+	defer unlock()
+
 	for attempt := 0; attempt < 2; attempt++ {
 		response, err = service.loginOnce(ctx, deviceID)
 		if !errors.Is(err, errRestartLogin) {
@@ -125,6 +133,16 @@ func (service *serviceApp) loginOnce(ctx context.Context, deviceID string) (resp
 	client.Disconnect()
 	instance.ClearPasskeyState()
 
+	// Start every QR login on a fresh client. Disconnect emits no event, so the QR
+	// channel of a previous login stays registered on the client and, once its context
+	// expires, disconnects the next session right after its QR code is shown (#851).
+	if client.Store.ID == nil {
+		instance.SetClient(nil)
+		if instance, client, err = service.ensureClient(ctx, deviceID); err != nil {
+			return response, err
+		}
+	}
+
 	// Use a detached context for the QR channel so the pairing session
 	// survives after the HTTP response is sent. The HTTP request context
 	// has a short timeout (e.g. 45s) which would cancel the QR emitter
@@ -167,7 +185,18 @@ func (service *serviceApp) loginOnce(ctx context.Context, deviceID string) (resp
 				}
 			}
 		}()
-		for evt := range ch {
+		for {
+			var evt whatsmeow.QRChannelItem
+			select {
+			case item, ok := <-ch:
+				if !ok {
+					return
+				}
+				evt = item
+			case <-qrCtx.Done():
+				// A superseded login's channel is never closed; stop with its QR window.
+				return
+			}
 			response.Code = evt.Code
 			// Use (nearly) the full WhatsApp QR lifetime. Halving it made FlexBase
 			// re-call Login() while the phone could still scan, and each Login()
@@ -249,6 +278,12 @@ func (service *serviceApp) LoginWithCode(ctx context.Context, deviceID string, p
 		logrus.Errorf("Error when validate login with code: %s", err.Error())
 		return loginCode, err
 	}
+
+	unlock, err := service.lockLogin(ctx, deviceID)
+	if err != nil {
+		return loginCode, err
+	}
+	defer unlock()
 
 	instance, client, err := service.ensureClient(ctx, deviceID)
 	if err != nil {
@@ -525,4 +560,22 @@ func (service *serviceApp) ensureClient(ctx context.Context, deviceID string) (*
 	}
 
 	return instance, client, nil
+}
+
+// lockLogin serializes login flows per device. Login swaps an unpaired device's
+// client, which must not happen while an overlapping login is still using it.
+func (service *serviceApp) lockLogin(ctx context.Context, deviceID string) (unlock func(), err error) {
+	value, _ := service.loginLocks.LoadOrStore(deviceID, make(chan struct{}, 1))
+	lock := value.(chan struct{})
+	select {
+	case lock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	// select picks randomly when both cases are ready; don't run a cancelled request.
+	if err := ctx.Err(); err != nil {
+		<-lock
+		return nil, err
+	}
+	return func() { <-lock }, nil
 }
