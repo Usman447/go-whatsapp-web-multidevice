@@ -33,6 +33,29 @@ type DeviceManager struct {
 	initOnce sync.Once
 }
 
+// logoutMaxAttempts is how many times an explicit logout tries to unlink the
+// companion device on WhatsApp before giving up. The local session is deleted
+// only after one of those attempts succeeds, so a later click can retry.
+var logoutMaxAttempts = 3
+
+// logoutRetryDelay is the pause between failed unlink attempts.
+var logoutRetryDelay = 2 * time.Second
+
+// logoutConnect dials WhatsApp when the socket is down so Logout() can send
+// the remove-companion-device request. Tests replace it to avoid a real dial.
+var logoutConnect = func(ctx context.Context, cli *whatsmeow.Client) error {
+	if cli == nil {
+		return fmt.Errorf("whatsapp client is nil")
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if cli.IsConnected() {
+		return nil
+	}
+	return cli.Connect()
+}
+
 func NewDeviceManager(store *sqlstore.Container, keys *sqlstore.Container, chatStorageRepo domainChatStorage.IChatStorageRepository) *DeviceManager {
 	return &DeviceManager{
 		devices: make(map[string]*DeviceInstance),
@@ -328,10 +351,11 @@ func (m *DeviceManager) PurgeDevice(ctx context.Context, deviceID string) error 
 	return firstErr
 }
 
-// LogoutDeviceKeepSlot logs the device out of WhatsApp (clearing its session/keys)
-// but PRESERVES the device slot in the registry, so it keeps its id and display name
-// and can be re-paired later under the same id. Unlike PurgeDevice, it does not remove
-// the device record. Removing the slot entirely is the job of RemoveDevice (DELETE).
+// LogoutDeviceKeepSlot unlinks the companion device on WhatsApp, then clears the
+// local session while PRESERVING the device slot (id + display name) so it can be
+// re-paired. The local session is removed only after WhatsApp accepts the unlink.
+// A failed attempt leaves the stored session in place so logout can be retried.
+// Removing the slot entirely is the job of RemoveDevice (DELETE) / PurgeDevice.
 func (m *DeviceManager) LogoutDeviceKeepSlot(ctx context.Context, deviceID string) error {
 	if deviceID == "" {
 		return fmt.Errorf("device id is required")
@@ -342,22 +366,134 @@ func (m *DeviceManager) LogoutDeviceKeepSlot(ctx context.Context, deviceID strin
 		return fmt.Errorf("device %s not found", deviceID)
 	}
 
-	if cli := inst.GetClient(); cli != nil {
-		// Attempt the unlink whenever the client is paired (Store.ID set), not only when
-		// IsLoggedIn: that is true only while connected, and skipping the attempt for a
-		// momentarily-offline client would leave the phone showing the linked device
-		// forever (the local session is deleted below, so it can never unlink later).
-		// The WhatsApp unlink is best-effort: a dead/expired session may fail
-		// here, but that must not block the local keep-slot cleanup below.
-		if cli.Store != nil && cli.Store.ID != nil {
-			if err := cli.Logout(ctx); err != nil {
-				logrus.WithError(err).Warnf("[DEVICE_MANAGER] remote unlink failed for device %s (best-effort)", deviceID)
-			}
-		}
-		cli.Disconnect()
+	if err := m.unlinkPairedSession(ctx, inst); err != nil {
+		return err
 	}
 
-	return m.keepSlotLogout(ctx, deviceID)
+	if err := m.keepSlotLogout(ctx, deviceID); err != nil {
+		logrus.WithError(err).Warnf("[LOGOUT][%s] unlink succeeded but local cleanup failed", deviceID)
+		return err
+	}
+	logrus.Infof("[LOGOUT][%s] local session cleared", deviceID)
+	return nil
+}
+
+// unlinkPairedSession sends WhatsApp's remove-companion-device request.
+// It returns nil when there is no local session, or when an attempt succeeds.
+// It returns an error, without deleting store rows, when every attempt fails.
+func (m *DeviceManager) unlinkPairedSession(ctx context.Context, inst *DeviceInstance) error {
+	deviceID := inst.ID()
+	remembered := storeIdentity(inst)
+	attempts := logoutMaxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		cli := inst.GetClient()
+		if cli == nil && m.store != nil {
+			ensured, err := m.EnsureClient(ctx, deviceID)
+			if err != nil {
+				lastErr = err
+				logrus.WithError(err).Warnf("[LOGOUT][%s] attempt %d/%d could not attach a client", deviceID, attempt, attempts)
+				if !m.waitLogoutRetry(ctx) {
+					return ctx.Err()
+				}
+				continue
+			}
+			cli = ensured.GetClient()
+		}
+
+		hasSession := cli != nil && cli.Store != nil && cli.Store.ID != nil
+		connected := cli != nil && cli.IsConnected()
+		logrus.Infof("[LOGOUT][%s] attempt %d/%d connected=%t has_session=%t", deviceID, attempt, attempts, connected, hasSession)
+
+		if !hasSession {
+			// A slot that still remembers a number, with that number's row still in
+			// sqlite, is a paired session we failed to attach. Deleting it would
+			// drop the keys needed for a later unlink.
+			if remembered != "" && m.storeStillHasIdentity(ctx, remembered) {
+				lastErr = fmt.Errorf("paired session for %s is still stored", deviceID)
+				logrus.WithError(lastErr).Warnf("[LOGOUT][%s] attempt %d/%d stored session was not attached", deviceID, attempt, attempts)
+				if !m.waitLogoutRetry(ctx) {
+					return ctx.Err()
+				}
+				continue
+			}
+			logrus.Infof("[LOGOUT][%s] no local WhatsApp session to unlink", deviceID)
+			return nil
+		}
+
+		if err := cli.Logout(ctx); err != nil {
+			lastErr = err
+			logrus.WithError(err).Warnf("[LOGOUT][%s] remote unlink failed on attempt %d/%d connected=%t", deviceID, attempt, attempts, connected)
+		} else {
+			logrus.Infof("[LOGOUT][%s] remote unlink succeeded on attempt %d/%d", deviceID, attempt, attempts)
+			return nil
+		}
+
+		if cli.IsConnected() {
+			if !m.waitLogoutRetry(ctx) {
+				return ctx.Err()
+			}
+			continue
+		}
+
+		if err := logoutConnect(ctx, cli); err != nil {
+			lastErr = err
+			logrus.WithError(err).Warnf("[LOGOUT][%s] connect failed on attempt %d/%d", deviceID, attempt, attempts)
+			if !m.waitLogoutRetry(ctx) {
+				return ctx.Err()
+			}
+			continue
+		}
+
+		if err := cli.Logout(ctx); err != nil {
+			lastErr = err
+			logrus.WithError(err).Warnf("[LOGOUT][%s] remote unlink failed after connect on attempt %d/%d", deviceID, attempt, attempts)
+			if !m.waitLogoutRetry(ctx) {
+				return ctx.Err()
+			}
+			continue
+		}
+
+		logrus.Infof("[LOGOUT][%s] remote unlink succeeded after connect on attempt %d/%d", deviceID, attempt, attempts)
+		return nil
+	}
+
+	logrus.WithError(lastErr).Warnf("[LOGOUT][%s] unlink failed after %d attempts; local session kept", deviceID, attempts)
+	return fmt.Errorf("could not unlink WhatsApp for device %s after %d attempts: %w", deviceID, attempts, lastErr)
+}
+
+func (m *DeviceManager) storeStillHasIdentity(ctx context.Context, jid string) bool {
+	if m == nil || m.store == nil {
+		return false
+	}
+	target, err := types.ParseJID(jid)
+	if err != nil || target.User == "" {
+		return false
+	}
+	dev, err := findStoreDeviceByJID(ctx, m.store, target)
+	return err == nil && dev != nil && dev.ID != nil
+}
+
+func (m *DeviceManager) waitLogoutRetry(ctx context.Context) bool {
+	if logoutRetryDelay <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(logoutRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // keepSlotLogout is the shared "logout but keep the slot" cleanup used by both explicit

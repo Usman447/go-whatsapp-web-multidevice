@@ -65,13 +65,29 @@ func assertStoreLacksJID(t *testing.T, ctx context.Context, c *sqlstore.Containe
 	}
 }
 
-// Scenario: keep-slot logout for a slot that was loaded from storage with NO live
-// client (the case aldinokemal flagged at device_manager.go:240). The orphan whatsmeow
-// rows must be deleted by JID from BOTH the primary and the separate keys container,
-// while the slot itself (id + display name) is preserved with an empty persisted JID.
-// The slot id is deliberately different from the JID to prove matching is by JID, not
-// by the slot id (the latent AD-JID-vs-slot-id mismatch in the old code).
-func TestLogoutDeviceKeepSlot_NoClientDeletesStoreRowsByJIDKeepsSlot(t *testing.T) {
+// useFastLogoutHooks makes unlink retries fail immediately instead of dialing WhatsApp.
+func useFastLogoutHooks(t *testing.T) {
+	t.Helper()
+	prevAttempts := logoutMaxAttempts
+	prevDelay := logoutRetryDelay
+	prevConnect := logoutConnect
+	logoutMaxAttempts = 1
+	logoutRetryDelay = 0
+	logoutConnect = func(context.Context, *whatsmeow.Client) error {
+		return errors.New("offline")
+	}
+	t.Cleanup(func() {
+		logoutMaxAttempts = prevAttempts
+		logoutRetryDelay = prevDelay
+		logoutConnect = prevConnect
+	})
+}
+
+// A stored session with no live client must not be deleted when the unlink cannot
+// be sent. The rows stay so a later logout can still ask WhatsApp to remove the
+// companion device. The slot id is deliberately different from the JID.
+func TestLogoutDeviceKeepSlot_NoClientKeepsStoreRowsWhenUnlinkFails(t *testing.T) {
+	useFastLogoutHooks(t)
 	ctx := context.Background()
 	primaryStore := newTestSQLStore(t)
 	keysStore := newTestSQLStore(t)
@@ -92,25 +108,33 @@ func TestLogoutDeviceKeepSlot_NoClientDeletesStoreRowsByJIDKeepsSlot(t *testing.
 	inst := &DeviceInstance{id: slotID, jid: nonAD, displayName: "tIAtendo", createdAt: time.Now()}
 	manager.devices[slotID] = inst
 
-	if err := manager.LogoutDeviceKeepSlot(ctx, slotID); err != nil {
-		t.Fatalf("LogoutDeviceKeepSlot returned error: %v", err)
+	err := manager.LogoutDeviceKeepSlot(ctx, slotID)
+	if err == nil || !strings.Contains(err.Error(), "could not unlink") {
+		t.Fatalf("expected unlink failure, got %v", err)
 	}
 
-	assertStoreLacksJID(t, ctx, primaryStore, nonAD)
-	assertStoreLacksJID(t, ctx, keysStore, nonAD)
+	devices, listErr := primaryStore.GetAllDevices(ctx)
+	if listErr != nil {
+		t.Fatalf("get all devices: %v", listErr)
+	}
+	found := false
+	for _, dev := range devices {
+		if dev != nil && dev.ID != nil && dev.ID.ToNonAD().String() == nonAD {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected stored session to be kept after a failed unlink")
+	}
 
 	if _, ok := manager.GetDevice(slotID); !ok {
-		t.Fatal("expected slot to be kept after logout")
+		t.Fatal("expected slot to be kept after failed logout")
 	}
-	if got := inst.JID(); got != "" {
-		t.Fatalf("expected instance JID cleared after logout, got %q", got)
+	if got := inst.JID(); got == "" {
+		t.Fatal("expected instance JID to stay set so a later logout can unlink")
 	}
-	if len(storage.savedRecords) == 0 {
-		t.Fatal("expected SaveDeviceRecord to persist the kept slot")
-	}
-	last := storage.savedRecords[len(storage.savedRecords)-1]
-	if last.DeviceID != slotID || last.JID != "" {
-		t.Fatalf("expected persisted slot %s with empty JID, got %s / %q", slotID, last.DeviceID, last.JID)
+	if len(storage.savedRecords) != 0 {
+		t.Fatal("expected no slot reset when the unlink fails")
 	}
 }
 
@@ -265,13 +289,12 @@ func TestKeepSlotLogout_StaleADJIDFallsBackToJIDResolution(t *testing.T) {
 	}
 }
 
-// Scenario: explicit logout for a paired client that is currently DISCONNECTED.
-// IsLoggedIn() is only true while connected, so gating the unlink on it silently skips
-// the remove-companion-device IQ and the phone keeps showing the linked device forever
-// (the local session is deleted, so it can never reconnect to unlink later). The unlink
-// must be ATTEMPTED whenever the client is paired (Store.ID set); failure stays
-// best-effort and must not fail the local keep-slot cleanup.
+// Explicit logout for a paired client that is currently disconnected must still
+// TRY the unlink. When that fails, the stored session stays so a later logout
+// can send remove-companion-device. Deleting the rows here would make that
+// retry impossible.
 func TestLogoutDeviceKeepSlot_AttemptsUnlinkWhenPairedButDisconnected(t *testing.T) {
+	useFastLogoutHooks(t)
 	ctx := context.Background()
 	primaryStore := newTestSQLStore(t)
 
@@ -295,29 +318,46 @@ func TestLogoutDeviceKeepSlot_AttemptsUnlinkWhenPairedButDisconnected(t *testing
 	hook := logrustest.NewLocal(logrus.StandardLogger())
 	defer hook.Reset()
 
-	if err := manager.LogoutDeviceKeepSlot(ctx, slotID); err != nil {
-		t.Fatalf("LogoutDeviceKeepSlot returned error: %v", err)
+	err := manager.LogoutDeviceKeepSlot(ctx, slotID)
+	if err == nil || !strings.Contains(err.Error(), "could not unlink") {
+		t.Fatalf("expected unlink failure, got %v", err)
 	}
 
-	// The unlink attempt fails offline (best-effort), which is observable as the
-	// remote-unlink warning. No warning means the attempt was skipped entirely.
 	attempted := false
+	kept := false
 	for _, entry := range hook.AllEntries() {
 		if strings.Contains(entry.Message, "remote unlink failed") {
 			attempted = true
+		}
+		if strings.Contains(entry.Message, "local session kept") {
+			kept = true
 		}
 	}
 	if !attempted {
 		t.Fatal("expected cli.Logout to be attempted for a paired-but-disconnected client")
 	}
-
-	// Local keep-slot cleanup must still have run.
-	assertStoreLacksJID(t, ctx, primaryStore, nonAD)
-	if _, ok := manager.GetDevice(slotID); !ok {
-		t.Fatal("expected slot to be kept after logout")
+	if !kept {
+		t.Fatal("expected local session to be kept after the failed unlink")
 	}
-	if got := inst.JID(); got != "" {
-		t.Fatalf("expected instance JID cleared after logout, got %q", got)
+
+	devices, listErr := primaryStore.GetAllDevices(ctx)
+	if listErr != nil {
+		t.Fatalf("get all devices: %v", listErr)
+	}
+	found := false
+	for _, row := range devices {
+		if row != nil && row.ID != nil && row.ID.ToNonAD().String() == nonAD {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected stored session to remain after a failed unlink")
+	}
+	if _, ok := manager.GetDevice(slotID); !ok {
+		t.Fatal("expected slot to be kept after failed logout")
+	}
+	if got := inst.JID(); got == "" {
+		t.Fatal("expected instance JID to stay set after a failed unlink")
 	}
 }
 
