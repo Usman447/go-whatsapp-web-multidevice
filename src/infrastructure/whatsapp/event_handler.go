@@ -3,6 +3,7 @@ package whatsapp
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -302,25 +303,22 @@ func handleConnectionEvents(_ context.Context, client *whatsmeow.Client, instanc
 	sendConfiguredPresence(context.Background(), client)
 }
 
-// handleStreamReplaced handles WhatsApp replacing this device's connection with
-// another one that uses the same session (e.g. a second process with a copy of
-// the session storage). Only the affected device is taken offline; the process
-// and the other devices keep running. whatsmeow does not reconnect after this
-// event, so the device stays disconnected until it is reconnected explicitly.
+// exitProcess is os.Exit in production. Tests replace it so a stream-replaced
+// event does not stop the test binary. FlexBase gym hosts restart this process
+// (systemd Restart=always, WinSW onfailure) and SetAutoConnectAfterBooting
+// reconnects the saved session. whatsmeow will not reconnect after this event,
+// so staying up would leave the device offline until a manual reconnect.
+var exitProcess = os.Exit
+
+// handleStreamReplaced exits the process when WhatsApp replaces this device's
+// connection with another client that uses the same session.
 func handleStreamReplaced(instance *DeviceInstance) {
-	deviceID := instance.ID()
-	logrus.Warnf("[STREAM_REPLACED] Connection for device %s was replaced by another client using the same session; disconnecting this device", deviceID)
-
-	if client := instance.GetClient(); client != nil {
-		client.Disconnect()
+	deviceID := ""
+	if instance != nil {
+		deviceID = instance.ID()
 	}
-	instance.SetState(domainDevice.DeviceStateDisconnected)
-
-	websocket.Broadcast <- websocket.BroadcastMessage{
-		Code:    "DEVICE_STREAM_REPLACED",
-		Message: "Device connection was replaced by another client using the same session",
-		Result:  map[string]string{"device_id": deviceID},
-	}
+	logrus.Warnf("[STREAM_REPLACED] Connection for device %s was replaced by another client using the same session; exiting so the service can restart", deviceID)
+	exitProcess(0)
 }
 
 func handleReceipt(ctx context.Context, evt *events.Receipt, deviceID string, client *whatsmeow.Client) {

@@ -66,28 +66,29 @@ func TestResolvePresenceOnConnect(t *testing.T) {
 	}
 }
 
-// A StreamReplaced event for one device used to call os.Exit(0) and take every
-// device in the process down with it (#883). It must only disconnect that device.
-func TestHandlerStreamReplacedOnlyDisconnectsThatDevice(t *testing.T) {
-	ctx := context.Background()
+// FlexBase gym hosts recover a replaced session by exiting. systemd and WinSW
+// restart the process, and startup reconnects the saved login. Staying up would
+// leave the device offline because whatsmeow does not reconnect after this event.
+func TestHandlerStreamReplacedExitsProcess(t *testing.T) {
 	replaced := NewDeviceInstance("test-stream-replaced", nil, nil)
 	replaced.SetState(domainDevice.DeviceStateLoggedIn)
 	other := NewDeviceInstance("test-stream-other", nil, nil)
 	other.SetState(domainDevice.DeviceStateLoggedIn)
 
-	go handler(ctx, replaced, &events.StreamReplaced{})
-	msg := recvBroadcast(t)
-	if msg.Code != "DEVICE_STREAM_REPLACED" {
-		t.Fatalf("broadcast code = %s, want DEVICE_STREAM_REPLACED", msg.Code)
+	var got *int
+	orig := exitProcess
+	exitProcess = func(code int) {
+		c := code
+		got = &c
 	}
-	if result, ok := msg.Result.(map[string]string); !ok || result["device_id"] != "test-stream-replaced" {
-		t.Errorf("broadcast result = %#v, want device_id test-stream-replaced", msg.Result)
-	}
+	t.Cleanup(func() { exitProcess = orig })
 
-	if got := replaced.State(); got != domainDevice.DeviceStateDisconnected {
-		t.Errorf("replaced device state = %s, want %s", got, domainDevice.DeviceStateDisconnected)
+	handler(context.Background(), replaced, &events.StreamReplaced{})
+
+	if got == nil || *got != 0 {
+		t.Fatalf("exit code = %v, want 0", got)
 	}
-	if got := other.State(); got != domainDevice.DeviceStateLoggedIn {
-		t.Errorf("other device state = %s, want %s", got, domainDevice.DeviceStateLoggedIn)
+	if state := other.State(); state != domainDevice.DeviceStateLoggedIn {
+		t.Errorf("other device state = %s, want %s", state, domainDevice.DeviceStateLoggedIn)
 	}
 }
